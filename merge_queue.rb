@@ -37,6 +37,11 @@ OptionParser.new do |opts|
   opts.on("-p", "--pr PR1,PR2,...", Array, "The PR numbers to merge") do |pr_numbers|
     options[:pr_numbers] = pr_numbers
   end
+
+  options[:skip_merge] = false
+  opts.on("-s", "--skip-merge", "Skip merging the PRs") do
+    options[:skip_merge] = true
+  end
 end.parse!
 
 # Check that all required options are present
@@ -62,10 +67,14 @@ options[:pr_numbers].each do |pr_number|
   # Get the PR details
   pr = client.pull_request(options[:repo], pr_number)
 
-  # Check if the PR has all of the required reviews
-  puts "INFO: Waiting for reviews to complete for PR #{pr_number}"
-  sleep 60 until !client.pull_request_reviews(options[:repo], pr_number).empty? && client.pull_request_reviews(options[:repo], pr_number).any? { |review| review.state == 'APPROVED' }
-  puts "INFO: Reviews completed for PR #{pr_number}"
+  if options[:skip_merge]
+    puts "INFO: No reviews required since --skip-merge was specified"
+  else
+    # Check if the PR has all of the required reviews
+    puts "INFO: Waiting for reviews to complete for PR #{pr_number}"
+    sleep 60 until !client.pull_request_reviews(options[:repo], pr_number).empty? && client.pull_request_reviews(options[:repo], pr_number).any? { |review| review.state == 'APPROVED' }
+    puts "INFO: Reviews completed for PR #{pr_number}"
+  end
 
   # Rerun failed checks up to 3 times
   checks_rerun_count = 0
@@ -99,14 +108,18 @@ options[:pr_numbers].each do |pr_number|
     end
   end
 
-  # Merge the PR using squash and merge
-  begin
-    client.merge_pull_request(options[:repo], pr_number, '', {commit_message: '', merge_method: 'squash'})
-  rescue Octokit::UnprocessableEntity => e
-    puts "ERROR: Failed to merge PR #{pr_number}: #{e.message}"
-    next
-  end
+  if options[:skip_merge]
+    puts "INFO: Skipping merge for PR #{pr_number}"
+  else
+    # Merge the PR using squash and merge
+    begin
+      client.merge_pull_request(options[:repo], pr_number, '', {commit_message: '', merge_method: 'squash'})
+    rescue Octokit::UnprocessableEntity => e
+      puts "ERROR: Failed to merge PR #{pr_number}: #{e.message}"
+      next
+    end
 
-  puts "SUCCESS: PR #{pr_number} merged successfully"
-  sleep 30 # Wait for the merge to complete before processing the next PR
+    puts "SUCCESS: PR #{pr_number} merged successfully"
+    sleep 30 # Wait for the merge to complete before processing the next PR
+  end
 end
