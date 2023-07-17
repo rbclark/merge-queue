@@ -3,6 +3,8 @@
 require 'octokit'
 require 'optparse'
 
+MAX_RETRIES=11
+
 module Octokit
   class Client
     module ActionsWorkflowRuns
@@ -42,6 +44,11 @@ OptionParser.new do |opts|
   opts.on("-s", "--skip-merge", "Skip merging the PRs") do
     options[:skip_merge] = true
   end
+
+  options[:max_retries] = 3
+  opts.on("-m", "--max-retries RETRIES", Integer, "Maximum number of retries (max #{MAX_RETRIES})") do |max_retries|
+    options[:max_retries] = max_retries
+  end
 end.parse!
 
 # Check that all required options are present
@@ -51,6 +58,13 @@ if options[:repo].nil? || options[:pr_numbers].nil?
   puts OptionParser.new.help
   exit 1
 end
+
+# Limit number of retries
+if options[:max_retries] > MAX_RETRIES
+  puts "ERROR: That's really a lot of retries. Maybe not so many (< #{MAX_RETRIES})?"
+  exit 1
+end
+
 
 # Retrieve the GitHub token from the environment variable
 github_token = ENV['GITHUB_TOKEN']
