@@ -102,12 +102,12 @@ client = Octokit::Client.new(access_token: github_token)
 rspec_failures = Concurrent::Array.new
 total_test_runs = 0
 
-one_month_ago = (Time.now - 30*24*60*60).utc.strftime('%Y-%m-%d')
+one_week_ago = (Time.now - 7*24*60*60).utc.strftime('%Y-%m-%d')
 
 run_ids = client.workflow_runs(
   options[:repo],
   options[:workflow_name],
-  {status: "failure", per_page: 100, created: ">=#{one_month_ago}"}
+  {status: "failure", per_page: 100, created: ">=#{one_week_ago}"}
 )[:workflow_runs].map(&:id)
 
 total_test_runs = run_ids.count
@@ -147,7 +147,7 @@ pool.wait_for_termination
 # Count the occurrences of each failure
 rspec_failure_counts = rspec_failures.each_with_object(Hash.new(0)) { |failure, counts| counts[failure] += 1 }
 
-puts "Most common rspec failures from the past month (#{total_test_runs} total workflows run):"
+puts "Most common rspec failures from the past week (#{total_test_runs} total workflows run):"
 
 # Print the rspec failures and their counts, sorted by count
 rspec_failure_counts.sort_by { |_file, counts| -counts }.each do |file, counts|
