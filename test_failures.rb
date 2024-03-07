@@ -12,14 +12,10 @@ Octokit.configure do |c|
   c.auto_paginate = true
 end
 
-# Regular expression to match rspec failures
-RSPEC_FAILURE_REGEX = /rspec \.\/spec\/.*\/.*_spec\.rb:\d+.*$/
-
 NETWORK_RETRIES = 3
 
 def fetch_with_retry(url)
   attempts = 0
-
   begin
     URI.open(url).read
   rescue => e
@@ -49,32 +45,66 @@ def fetch_workflow_run_logs_with_retry(client, repo, run_id)
   end
 end
 
-# Function to process log file content
-def process_content(content)
-  failures = []
-  # Split the content into lines
-  log_lines = content.split("\n")
+def extract_failures_and_details(content)
+  failures = {}
+  current_failure = nil
+  current_details = []
+  capture_details = false
 
-  # Iterate over the lines in the log
-  log_lines.each do |line|
-    # Check if the line is an rspec failure
-    if match = RSPEC_FAILURE_REGEX.match(line)
-      # Add the rspec failure to the array
-      failures << match[0]
+  content.each_line do |line|
+    line = line.sub(/^[^ ]+\s+/, '').rstrip
+
+    if line.start_with?(/\d+\) /)
+      if current_failure
+        failures[current_failure][:details] ||= []
+        failures[current_failure][:details] << current_details unless current_details.empty?
+        current_details = []
+      end
+      current_failure = line.sub(/\d+\) /, '')
+      failures[current_failure] ||= { count: 0, details: [] }
+      capture_details = true
+    elsif line.start_with?('Finished in')
+      capture_details = false
+    elsif capture_details
+      next if unwanted_line?(line)
+      current_details << line.strip
     end
   end
-  return failures
+
+  if current_failure && !current_details.empty?
+    failures[current_failure][:details] ||= []
+    failures[current_failure][:details] << current_details
+  end
+
+  failures
+end
+
+def unwanted_line?(line)
+  line.empty? ||
+    line.start_with?('# ./vendor/bundle') ||
+    line.start_with?('[Screenshot Image]:') ||
+    line.end_with?('<unknown>')
+end
+
+def merge_similar_details(details_array)
+  merged_details = []
+
+  details_array.each do |details|
+    error_message = details.reject { |line| line.start_with?('# ') }.join("\n")
+    similar_details = merged_details.find { |d| d.reject { |line| line.start_with?('# ') }.join("\n") == error_message }
+    merged_details << details unless similar_details
+  end
+
+  merged_details
 end
 
 # Parse command line options
 options = {}
 OptionParser.new do |opts|
   opts.banner = "Usage: test_failures.rb [options]"
-
   opts.on("-r", "--repo REPO", "The name of the repository") do |repo|
     options[:repo] = repo
   end
-
   opts.on("-w", "--workflow-filename WORKFLOW_FILENAME", "The filename of the workflow to analyze") do |workflow_name|
     options[:workflow_name] = workflow_name
   end
@@ -98,8 +128,9 @@ end
 # Initialize the Octokit client with the GitHub token
 client = Octokit::Client.new(access_token: github_token)
 
-# Array to store rspec failures
-rspec_failures = Concurrent::Array.new
+# Hash to store rspec failures and their details
+rspec_failures = Concurrent::Hash.new { |h, k| h[k] = { count: 0, details: [] } }
+
 total_test_runs = 0
 
 one_week_ago = (Time.now - 7*24*60*60).utc.strftime('%Y-%m-%d')
@@ -112,7 +143,7 @@ run_ids = client.workflow_runs(
 
 total_test_runs = run_ids.count
 
-pool = Concurrent::FixedThreadPool.new(5)
+pool = Concurrent::FixedThreadPool.new(1)
 
 run_ids.each do |run|
   pool.post do
@@ -127,7 +158,11 @@ run_ids.each do |run|
           zip_file.each do |entry|
             if entry.file?
               content = entry.get_input_stream.read
-              rspec_failures.concat(process_content(content))
+              failures = extract_failures_and_details(content)
+              failures.each do |failure, details|
+                rspec_failures[failure][:count] += details[:details].size
+                rspec_failures[failure][:details].concat(details[:details])
+              end
             end
           end
         end
@@ -144,12 +179,20 @@ end
 pool.shutdown
 pool.wait_for_termination
 
-# Count the occurrences of each failure
-rspec_failure_counts = rspec_failures.each_with_object(Hash.new(0)) { |failure, counts| counts[failure] += 1 }
+puts "Most common RSpec failures from the past week (#{total_test_runs} total workflows run):\n\n"
 
-puts "Most common rspec failures from the past week (#{total_test_runs} total workflows run):"
-
-# Print the rspec failures and their counts, sorted by count
-rspec_failure_counts.sort_by { |_file, counts| -counts }.each do |file, counts|
-  puts "#{file}: #{counts}"
+# Print the failures, their counts, and details with indentation using tabs
+rspec_failures.sort_by { |_, details| -details[:count] }.each do |failure, details|
+  puts "#{failure} (Count: #{details[:count]})\n\n"
+  merged_details = merge_similar_details(details[:details])
+  merged_details.each_with_index do |detail_lines, index|
+    detail_lines.each_with_index do |line, idx|
+      if idx.eql?(0)
+        puts "\t#{index+1}) #{line}"
+      else
+        puts "\t\t#{line}"
+      end
+    end
+    puts "\n"
+  end
 end
