@@ -13,7 +13,7 @@ Octokit.configure do |c|
 end
 
 # Regular expression to match rspec failures
-RSPEC_FAILURE_REGEX = /rspec \.\/spec\/.*\/.*_spec\.rb:\d+/
+RSPEC_FAILURE_REGEX = /rspec \.\/spec\/.*\/.*_spec\.rb:\d+.*$/
 
 NETWORK_RETRIES = 3
 
