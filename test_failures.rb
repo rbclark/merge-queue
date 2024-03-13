@@ -87,15 +87,18 @@ def unwanted_line?(line)
 end
 
 def merge_similar_details(details_array)
-  merged_details = []
+  merged_details = {}
 
   details_array.each do |details|
     error_message = details.reject { |line| line.start_with?('# ') }.join("\n")
-    similar_details = merged_details.find { |d| d.reject { |line| line.start_with?('# ') }.join("\n") == error_message }
-    merged_details << details unless similar_details
+    if merged_details.key?(error_message)
+      merged_details[error_message][:count] += 1
+    else
+      merged_details[error_message] = { count: 1, lines: details }
+    end
   end
 
-  merged_details
+  merged_details.values
 end
 
 # Parse command line options
@@ -156,7 +159,8 @@ run_ids.each do |run|
 
         Zip::File.open(log_zip) do |zip_file|
           zip_file.each do |entry|
-            if entry.file?
+            # Only process top level files, Github logs contain duplicate files within subdirectories
+            if entry.file? && !entry.name.include?('/')
               content = entry.get_input_stream.read
               failures = extract_failures_and_details(content)
               failures.each do |failure, details|
@@ -185,10 +189,11 @@ puts "Most common RSpec failures from the past week (#{total_test_runs} total wo
 rspec_failures.sort_by { |_, details| -details[:count] }.each do |failure, details|
   puts "#{failure} (Count: #{details[:count]})\n\n"
   merged_details = merge_similar_details(details[:details])
-  merged_details.each_with_index do |detail_lines, index|
-    detail_lines.each_with_index do |line, idx|
+  sorted_details = merged_details.sort_by { |detail| -detail[:count] }
+  sorted_details.each do |detail|
+    detail[:lines].each_with_index do |line, idx|
       if idx.eql?(0)
-        puts "\t#{index+1}) #{line}"
+        puts "\t(#{detail[:count]} times) #{line}"
       else
         puts "\t\t#{line}"
       end
