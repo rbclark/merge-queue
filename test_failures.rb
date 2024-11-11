@@ -5,7 +5,6 @@ require 'zip'
 require 'octokit'
 require 'optparse'
 require 'tempfile'
-require 'concurrent'
 
 # Enable auto-pagination
 Octokit.configure do |c|
@@ -14,14 +13,18 @@ end
 
 NETWORK_RETRIES = 3
 
-def fetch_with_retry(url)
+def fetch_attempt_data(client, attempt_url)
   attempts = 0
   begin
-    URI.open(url).read
+    client.get(attempt_url)
+  rescue Octokit::NotFound
+    # If the attempt is not found, return nil
+    puts "Attempt not found at #{attempt_url}"
+    return nil
   rescue => e
     attempts += 1
     if attempts <= NETWORK_RETRIES
-      sleep(2**attempts)
+      sleep(2 ** attempts)
       retry
     else
       raise e
@@ -29,18 +32,36 @@ def fetch_with_retry(url)
   end
 end
 
-def fetch_workflow_run_logs_with_retry(client, repo, run_id)
+def fetch_attempt_logs(logs_url, github_token)
   attempts = 0
-
   begin
-    client.workflow_run_logs(repo, run_id)
+    # Fetch logs using the logs_url with authentication headers
+    log_data = URI.open(logs_url,
+                        "Authorization" => "Bearer #{github_token}",
+                        "Accept" => "application/vnd.github.v3+json").read
+    log_data
+  rescue OpenURI::HTTPError => e
+    if e.io.status[0] == '404'
+      puts "Logs not found at #{logs_url}"
+      return nil
+    else
+      attempts += 1
+      if attempts <= NETWORK_RETRIES
+        sleep(2 ** attempts)
+        retry
+      else
+        puts "Error fetching logs from #{logs_url}: #{e.message}"
+        return nil
+      end
+    end
   rescue => e
     attempts += 1
     if attempts <= NETWORK_RETRIES
-      sleep(2**attempts)
+      sleep(2 ** attempts)
       retry
     else
-      raise e
+      puts "Error fetching logs from #{logs_url}: #{e.message}"
+      return nil
     end
   end
 end
@@ -50,21 +71,30 @@ def extract_failures_and_details(content)
   current_failure = nil
   current_details = []
   capture_details = false
+  in_pending_section = false
 
   content.each_line do |line|
     line = line.sub(/^[^ ]+\s+/, '').rstrip
 
-    if line.start_with?(/\d+\) /)
+    if line =~ /^Pending: \(Failures listed here are expected and do not affect your suite's status\)/
+      in_pending_section = true
+      next
+    elsif line.start_with?('Finished in')
+      capture_details = false
+      in_pending_section = false
+    end
+
+    # Skip lines in the pending section
+    next if in_pending_section
+
+    if line =~ /^\d+\) /
       if current_failure
-        failures[current_failure][:details] ||= []
         failures[current_failure][:details] << current_details unless current_details.empty?
         current_details = []
       end
-      current_failure = line.sub(/\d+\) /, '')
+      current_failure = line.sub(/^\d+\) /, '')
       failures[current_failure] ||= { count: 0, details: [] }
       capture_details = true
-    elsif line.start_with?('Finished in')
-      capture_details = false
     elsif capture_details
       next if unwanted_line?(line)
       current_details << line.strip
@@ -72,7 +102,6 @@ def extract_failures_and_details(content)
   end
 
   if current_failure && !current_details.empty?
-    failures[current_failure][:details] ||= []
     failures[current_failure][:details] << current_details
   end
 
@@ -105,7 +134,7 @@ end
 options = {}
 OptionParser.new do |opts|
   opts.banner = "Usage: test_failures.rb [options]"
-  opts.on("-r", "--repo REPO", "The name of the repository") do |repo|
+  opts.on("-r", "--repo REPO", "The name of the repository (e.g., 'owner/repo')") do |repo|
     options[:repo] = repo
   end
   opts.on("-w", "--workflow-filename WORKFLOW_FILENAME", "The filename of the workflow to analyze") do |workflow_name|
@@ -131,35 +160,52 @@ end
 # Initialize the Octokit client with the GitHub token
 client = Octokit::Client.new(access_token: github_token)
 
-# Hash to store rspec failures and their details
-rspec_failures = Concurrent::Hash.new { |h, k| h[k] = { count: 0, details: [] } }
+# Hash to store RSpec failures and their details
+rspec_failures = Hash.new { |h, k| h[k] = { count: 0, details: [] } }
 
 total_test_runs = 0
 
-one_week_ago = (Time.now - 7*24*60*60).utc.strftime('%Y-%m-%d')
+one_week_ago = (Time.now - 7 * 24 * 60 * 60).utc.iso8601
 
-run_ids = client.workflow_runs(
+# Fetch all workflow runs for the specified workflow within the time frame
+workflow_runs = client.workflow_runs(
   options[:repo],
   options[:workflow_name],
-  {status: "failure", per_page: 100, created: ">=#{one_week_ago}"}
-)[:workflow_runs].map(&:id)
+  { per_page: 100, created: ">=#{one_week_ago}" }
+)[:workflow_runs]
 
-total_test_runs = run_ids.count
+workflow_runs.each do |run|
+  begin
+    # Collect all attempts for this run by traversing previous_attempt_url
+    attempts = []
+    current_attempt = run
+    attempts << current_attempt
 
-pool = Concurrent::FixedThreadPool.new(1)
+    while current_attempt[:previous_attempt_url]
+      previous_attempt_url = current_attempt[:previous_attempt_url]
+      current_attempt = fetch_attempt_data(client, previous_attempt_url)
+      break unless current_attempt
+      attempts << current_attempt
+    end
 
-run_ids.each do |run|
-  pool.post do
-    begin
-      log_url = fetch_workflow_run_logs_with_retry(client, options[:repo], run)
+    # Increment total_test_runs by the number of attempts for this run
+    total_test_runs += attempts.size
+
+    attempts.each do |attempt|
+      # Fetch logs for each attempt using logs_url
+      logs_url = attempt[:logs_url]
+      log_data = fetch_attempt_logs(logs_url, github_token)
+      # Skip if no log data was returned
+      next if log_data.nil?
+
       Tempfile.create("log_zip") do |log_zip|
         log_zip.binmode
-        log_zip.write(fetch_with_retry(log_url))
+        log_zip.write(log_data)
         log_zip.rewind
 
         Zip::File.open(log_zip) do |zip_file|
           zip_file.each do |entry|
-            # Only process top level files, Github logs contain duplicate files within subdirectories
+            # Only process top-level files; GitHub logs contain duplicate files within subdirectories
             if entry.file? && !entry.name.include?('/')
               content = entry.get_input_stream.read
               failures = extract_failures_and_details(content)
@@ -171,33 +217,32 @@ run_ids.each do |run|
           end
         end
       end
-    rescue => e
-      puts "Error occurred in thread: #{e.message}"
-      puts "Backtrace: #{e.backtrace}"
-      raise e
     end
+  rescue => e
+    puts "Error occurred while processing run #{run.id}: #{e.message}"
+    puts "Backtrace: #{e.backtrace.join("\n")}"
   end
 end
 
-# Wait for all threads to finish
-pool.shutdown
-pool.wait_for_termination
+puts "Most common RSpec failures from the past week (#{total_test_runs} total test runs including retries):\n\n"
 
-puts "Most common RSpec failures from the past week (#{total_test_runs} total workflows run):\n\n"
-
-# Print the failures, their counts, and details with indentation using tabs
-rspec_failures.sort_by { |_, details| -details[:count] }.each do |failure, details|
-  puts "#{failure} (Count: #{details[:count]})\n\n"
-  merged_details = merge_similar_details(details[:details])
-  sorted_details = merged_details.sort_by { |detail| -detail[:count] }
-  sorted_details.each do |detail|
-    detail[:lines].each_with_index do |line, idx|
-      if idx.eql?(0)
-        puts "\t(#{detail[:count]} times) #{line}"
-      else
-        puts "\t\t#{line}"
+if rspec_failures.any?
+  # Print actual failures
+  rspec_failures.sort_by { |_, details| -details[:count] }.each do |failure, details|
+    puts "#{failure} (Count: #{details[:count]})\n\n"
+    merged_details = merge_similar_details(details[:details])
+    sorted_details = merged_details.sort_by { |detail| -detail[:count] }
+    sorted_details.each do |detail|
+      detail[:lines].each_with_index do |line, idx|
+        if idx.eql?(0)
+          puts "\t(#{detail[:count]} times) #{line}"
+        else
+          puts "\t\t#{line}"
+        end
       end
+      puts "\n"
     end
-    puts "\n"
   end
+else
+  puts "No failures detected.\n\n"
 end
