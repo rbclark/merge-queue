@@ -11,6 +11,9 @@ Octokit.configure do |c|
   c.auto_paginate = true
 end
 
+# Silence WARNING: invalid date/time in zip entry.
+Zip.warn_invalid_date = false
+
 NETWORK_RETRIES = 3
 
 def fetch_attempt_data(client, attempt_url)
@@ -79,9 +82,12 @@ def extract_failures_and_details(content)
     if line =~ /^Pending: \(Failures listed here are expected and do not affect your suite's status\)/
       in_pending_section = true
       next
-    elsif line.start_with?('Finished in')
-      capture_details = false
+    # This line indicates the end of the pending section and the start of actual failures
+    elsif line.eql?('Failures:')
       in_pending_section = false
+    # This is to avoid capturing all of the text following the failures section
+    elsif line.start_with?("Finished in")
+      capture_details = false
     end
 
     # Skip lines in the pending section
@@ -110,7 +116,8 @@ end
 
 def unwanted_line?(line)
   line.empty? ||
-    line.start_with?('# ./vendor/bundle') ||
+    line.match?(/^#?\s*(?:\.\/)?vendor\/bundle/) ||
+    line.match?(/^#?\s*\/opt\/hostedtoolcache\/Ruby/) ||
     line.start_with?('[Screenshot Image]:') ||
     line.end_with?('<unknown>')
 end
